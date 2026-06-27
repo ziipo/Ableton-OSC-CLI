@@ -1,5 +1,8 @@
 .venv/
+.env
 *.egg-info/
 __pycache__/
 *.pyc
 testProjects/
+.DS_Store
+.claude/

@@ -113,6 +113,19 @@ class Live:
         reply = self.c.query("/live/track/get/devices/name", track)
         return list(reply[1:])  # strip track_id
 
+    def get_num_devices(self, track: int) -> int:
+        return int(self.c.query("/live/track/get/num_devices", track)[1])
+
+    def get_device_class_names(self, track: int) -> List[str]:
+        reply = self.c.query("/live/track/get/devices/class_name", track)
+        return list(reply[1:])  # strip track_id
+
+    def get_device_class_name(self, track: int, device: int) -> str:
+        names = self.get_device_class_names(track)
+        if device < 0 or device >= len(names):
+            raise ValueError(f"Track {track} has no device at index {device}")
+        return names[device]
+
     def get_track_clip_names(self, track: int) -> List[str]:
         reply = self.c.query("/live/track/get/clips/name", track)
         return list(reply[1:])
@@ -177,6 +190,131 @@ class Live:
     def remove_notes(self, track: int, clip: int) -> None:
         """Remove all notes from a clip (full pitch and time span)."""
         self.c.send("/live/clip/remove/notes", track, clip, 0, 127, 0.0, 1_000_000.0)
+
+    # ---- device parameters ----
+    def get_device_param_count(self, track: int, device: int) -> int:
+        reply = self.c.query("/live/device/get/num_parameters", track, device)
+        return int(reply[2])  # strip track_id, device_id
+
+    def get_device_params(self, track: int, device: int) -> List[dict]:
+        """Return all parameters of a device as dicts with index/name/value/min/max."""
+        names = self.c.query("/live/device/get/parameters/name", track, device)[2:]
+        values = self.c.query("/live/device/get/parameters/value", track, device)[2:]
+        mins = self.c.query("/live/device/get/parameters/min", track, device)[2:]
+        maxes = self.c.query("/live/device/get/parameters/max", track, device)[2:]
+        params = []
+        for i, name in enumerate(names):
+            params.append({
+                "index": i,
+                "name": name,
+                "value": values[i] if i < len(values) else None,
+                "min": mins[i] if i < len(mins) else None,
+                "max": maxes[i] if i < len(maxes) else None,
+            })
+        return params
+
+    def set_device_param(self, track: int, device: int, index: int, value: float) -> None:
+        self.c.send("/live/device/set/parameter/value", track, device, int(index), float(value))
+
+    def resolve_param_index(self, track: int, device: int, param: str) -> int:
+        """Resolve a parameter reference (index or name) to its index.
+
+        Names match case-insensitively; an exact match is preferred over a
+        prefix/substring match.
+        """
+        if isinstance(param, int) or (isinstance(param, str) and param.lstrip("-").isdigit()):
+            return int(param)
+        params = self.get_device_params(track, device)
+        target = param.strip().lower()
+        exact = [p for p in params if str(p["name"]).lower() == target]
+        if exact:
+            return exact[0]["index"]
+        partial = [p for p in params if target in str(p["name"]).lower()]
+        if len(partial) == 1:
+            return partial[0]["index"]
+        if len(partial) > 1:
+            names = ", ".join(repr(p["name"]) for p in partial)
+            raise ValueError(f"Ambiguous parameter {param!r}; matches: {names}")
+        raise ValueError(f"No parameter matching {param!r} on track {track} device {device}")
+
+    def set_device_param_by_name(self, track: int, device: int, param: str, value: float) -> int:
+        index = self.resolve_param_index(track, device, param)
+        self.set_device_param(track, device, index, value)
+        return index
+
+    # ---- sends / return tracks ----
+    def create_return_track(self) -> None:
+        self.c.send("/live/song/create_return_track")
+
+    def delete_return_track(self, index: int) -> None:
+        self.c.send("/live/song/delete_return_track", index)
+
+    def get_send(self, track: int, send: int) -> float:
+        return float(self.c.query("/live/track/get/send", track, send)[2])
+
+    def set_send(self, track: int, send: int, value: float) -> None:
+        self.c.send("/live/track/set/send", track, int(send), float(value))
+
+    # ---- clip duplicate ----
+    def duplicate_clip_to(self, track: int, clip: int,
+                          target_track: int, target_clip: int) -> None:
+        self.c.send("/live/clip_slot/duplicate_clip_to", track, clip,
+                    target_track, target_clip)
+
+    # ---- view / selection ----
+    def set_selected_track(self, track: int) -> None:
+        self.c.send("/live/view/set/selected_track", track)
+
+    def get_selected_track(self) -> int:
+        return int(self.c.query("/live/view/get/selected_track")[0])
+
+    # ---- browser (requires the AbletonOSC browser handler) ----
+    def browser_categories(self) -> List[str]:
+        return list(self.c.query("/live/browser/get/categories"))
+
+    def browser_items(self, path: str = "") -> List[dict]:
+        """List the immediate children of the browser node at ``path``.
+
+        Reply layout: [echoed_path, name, uri, is_loadable, is_folder, ...].
+        """
+        reply = self.c.query("/live/browser/get/items", path)
+        data = reply[1:]  # strip echoed path
+        if len(data) == 2 and data[0] == "error":
+            raise ValueError(str(data[1]))
+        items = []
+        for i in range(0, len(data) - 3, 4):
+            items.append({
+                "name": data[i],
+                "uri": data[i + 1],
+                "is_loadable": bool(data[i + 2]),
+                "is_folder": bool(data[i + 3]),
+            })
+        return items
+
+    def browser_search(self, term: str, category: str = "",
+                       max_results: int = 50) -> List[dict]:
+        """Recursively find loadable items whose name contains ``term``.
+
+        Reply layout: [echoed_term, count, name, uri, name, uri, ...].
+        """
+        reply = self.c.query("/live/browser/search", term, category, int(max_results),
+                             timeout=max(self.c.timeout, 8.0))
+        data = reply[2:]  # strip echoed term + count
+        results = []
+        for i in range(0, len(data) - 1, 2):
+            results.append({"name": data[i], "uri": data[i + 1]})
+        return results
+
+    def browser_load(self, uri: str, track: Optional[int] = None) -> bool:
+        """Load a browser item by uri onto ``track`` (selected track if None).
+
+        Returns whether the uri resolved to a loadable item. Loading is async;
+        confirm with ``get_num_devices``.
+        """
+        track_arg = "" if track is None else int(track)
+        reply = self.c.query("/live/browser/load", uri, track_arg,
+                             timeout=max(self.c.timeout, 8.0))
+        return bool(reply[1])  # reply = (uri, found)
 
     # ---- scenes ----
     def fire_scene(self, scene: int) -> None:
